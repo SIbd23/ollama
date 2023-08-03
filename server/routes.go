@@ -97,11 +97,11 @@ func GenerateHandler(c *gin.Context) {
 				continue
 			}
 			vec := mat.NewVecDense(len(embed), embed)
-			activeSession.Embeddings = append(activeSession.Embeddings, vector.Embedding{Vector: vec, Data: e})
+			loaded.Embeddings = append(loaded.Embeddings, vector.Embedding{Vector: vec, Data: e})
 		}
 
-		activeSession.id = time.Now().UnixNano()
-		activeSession.llm = llm
+		loaded.id = time.Now().UnixNano()
+		loaded.llm = llm
 	}
 
 	sessionDuration := 5 * time.Minute

@@ -37,7 +37,8 @@ type Model struct {
 	System    string
 	Digest    string
 	Options   map[string]interface{}
-	// TODO: Embeddings should be a map of embedding name to embedding
+	// TODO: Embeddings should be a slice of Embedding structs
+	Embeddings []string
 }
 
 func (m *Model) Prompt(request api.GenerateRequest) (string, error) {
@@ -63,13 +64,13 @@ func (m *Model) Prompt(request api.GenerateRequest) (string, error) {
 
 	// TODO: move this to a separate template filling function
 	if len(m.Embeddings) > 0 {
-		promptEmbed, err := activeSession.llm.Embedding(request.Prompt)
+		promptEmbed, err := loaded.llm.Embedding(request.Prompt)
 		if err != nil {
 			return "", fmt.Errorf("failed to get embedding for prompt: %v", err)
 		}
 		// TODO: set embed_top from specified parameters in modelfile
 		embed_top := 3
-		embed := vector.TopK(embed_top, mat.NewVecDense(len(promptEmbed), promptEmbed), activeSession.Embeddings)
+		embed := vector.TopK(embed_top, mat.NewVecDense(len(promptEmbed), promptEmbed), loaded.Embeddings)
 		toEmbed := ""
 		for _, e := range embed {
 			toEmbed = fmt.Sprintf("%s %s", toEmbed, e.Embedding.Data)
