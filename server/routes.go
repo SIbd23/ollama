@@ -27,7 +27,6 @@ import (
 var loaded struct {
 	mu sync.Mutex
 
-	id         int64
 	llm        *llama.LLM
 	Embeddings []vector.Embedding
 
@@ -99,11 +98,7 @@ func GenerateHandler(c *gin.Context) {
 			vec := mat.NewVecDense(len(embed), embed)
 			loaded.Embeddings = append(loaded.Embeddings, vector.Embedding{Vector: vec, Data: e})
 		}
-
-		loaded.id = time.Now().UnixNano()
-		loaded.llm = llm
 	}
-
 	sessionDuration := 5 * time.Minute
 
 	loaded.expireAt = time.Now().Add(sessionDuration)
