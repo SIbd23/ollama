@@ -17,7 +17,6 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"gonum.org/v1/gonum/mat"
 
 	"github.com/jmorganca/ollama/api"
 	"github.com/jmorganca/ollama/llama"
@@ -76,8 +75,10 @@ func GenerateHandler(c *gin.Context) {
 		}
 
 		if model.Embeddings != nil && len(model.Embeddings) > 0 {
-			opts.EmbeddingOnly = true // embedding only means its possible to request only an embedding as well as generate text
+			opts.EmbeddingOnly = true // this is requried to generate embeddings, completions will still work
+			loaded.Embeddings = model.Embeddings
 		}
+
 		llm, err := llama.New(model.ModelPath, opts)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -87,17 +88,6 @@ func GenerateHandler(c *gin.Context) {
 		loaded.llm = llm
 		loaded.digest = model.Digest
 		loaded.options = opts
-		// load the embeddings
-		for _, e := range model.Embeddings {
-			embed, err := llm.Embedding(e)
-			if err != nil {
-				// try to continue loading the other embeddings
-				log.Printf("error loading embedding: %s", err)
-				continue
-			}
-			vec := mat.NewVecDense(len(embed), embed)
-			loaded.Embeddings = append(loaded.Embeddings, vector.Embedding{Vector: vec, Data: e})
-		}
 	}
 	sessionDuration := 5 * time.Minute
 

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -19,6 +20,7 @@ import (
 	"text/template"
 
 	"github.com/jmorganca/ollama/api"
+	"github.com/jmorganca/ollama/llama"
 	"github.com/jmorganca/ollama/parser"
 	"github.com/jmorganca/ollama/vector"
 	"gonum.org/v1/gonum/mat"
@@ -31,14 +33,13 @@ type RegistryOptions struct {
 }
 
 type Model struct {
-	Name      string `json:"name"`
-	ModelPath string
-	Template  string
-	System    string
-	Digest    string
-	Options   map[string]interface{}
-	// TODO: Embeddings should be a slice of Embedding structs
-	Embeddings []string
+	Name       string `json:"name"`
+	ModelPath  string
+	Template   string
+	System     string
+	Digest     string
+	Options    map[string]interface{}
+	Embeddings []vector.Embedding
 }
 
 func (m *Model) Prompt(request api.GenerateRequest) (string, error) {
@@ -175,14 +176,11 @@ func GetModel(name string) (*Model, error) {
 			if err != nil {
 				log.Fatalf("failed to open file: %s", err)
 			}
+			defer file.Close()
 
-			scanner := bufio.NewScanner(file)
-			scanner.Split(bufio.ScanLines)
-
-			for scanner.Scan() {
-				model.Embeddings = append(model.Embeddings, scanner.Text())
+			if err = json.NewDecoder(file).Decode(&model.Embeddings); err != nil {
+				return nil, err
 			}
-			file.Close()
 		case "application/vnd.ollama.image.template":
 			bts, err := os.ReadFile(filename)
 			if err != nil {
@@ -257,26 +255,28 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 
 	var layers []*LayerReader
 	params := make(map[string][]string)
-
+	var embedFiles []string // the files to embed need to be collected then embeddings generated after the model itself is pulled
+	var modelFile string
 	for _, c := range commands {
 		log.Printf("[%s] - %s\n", c.Name, c.Args)
 		switch c.Name {
 		case "model":
 			fn(api.ProgressResponse{Status: "looking for model"})
+			modelFile = c.Args
 			mf, err := GetManifest(ParseModelPath(c.Args))
 			if err != nil {
-				fp, err := filenameWithPath(path, c.Args)
+				modelFile, err := filenameWithPath(path, c.Args)
 				if err != nil {
 					return err
 				}
-				if _, err := os.Stat(fp); err != nil {
+				if _, err := os.Stat(modelFile); err != nil {
 					// the model file does not exist, try pulling it
 					if errors.Is(err, os.ErrNotExist) {
 						fn(api.ProgressResponse{Status: "pulling model file"})
 						if err := PullModel(c.Args, &RegistryOptions{}, fn); err != nil {
 							return err
 						}
-						mf, err = GetManifest(ParseModelPath(c.Args))
+						mf, err = GetManifest(ParseModelPath(modelFile))
 						if err != nil {
 							return fmt.Errorf("failed to open file after pull: %v", err)
 						}
@@ -288,7 +288,7 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 					// create a model from this specified file
 					fn(api.ProgressResponse{Status: "creating model layer"})
 
-					file, err := os.Open(fp)
+					file, err := os.Open(modelFile)
 					if err != nil {
 						return fmt.Errorf("failed to open file: %v", err)
 					}
@@ -312,52 +312,14 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 					layers = append(layers, newLayer)
 				}
 			}
-		case "license":
-			fn(api.ProgressResponse{Status: fmt.Sprintf("creating model %s layer", c.Name)})
-			// remove the prompt layer if one exists
-			mediaType := fmt.Sprintf("application/vnd.ollama.image.%s", c.Name)
-
-			layer, err := CreateLayer(strings.NewReader(c.Args))
-			if err != nil {
-				return err
-			}
-
-			layer.MediaType = mediaType
-			layers = append(layers, layer)
 		case "embed":
-			fn(api.ProgressResponse{Status: fmt.Sprintf("creating model %s layer", c.Name)})
-
-			mediaType := fmt.Sprintf("application/vnd.ollama.image.%s", c.Name)
-
 			// TODO: support entire directories here
 			embedFilePath, err := filenameWithPath(path, c.Args)
 			if err != nil {
 				return err
 			}
-			embedFile, err := os.Open(embedFilePath)
-			if err != nil {
-				return fmt.Errorf("could not open emded file: %w", err)
-			}
-			defer embedFile.Close()
-			r := io.Reader(embedFile)
-
-			digest, size := GetSHA256Digest(r)
-			// Reset the position of the reader after calculating the digest
-			if _, err := embedFile.Seek(0, 0); err != nil {
-				return fmt.Errorf("could not reset embed reader: %w", err)
-			}
-			layer := &LayerReader{
-				Layer: Layer{
-					MediaType: "application/vnd.docker.image.rootfs.diff.tar",
-					Digest:    digest,
-					Size:      size,
-				},
-				Reader: r,
-			}
-
-			layer.MediaType = mediaType
-			layers = append(layers, layer)
-		case "template", "system", "prompt":
+			embedFiles = append(embedFiles, embedFilePath)
+		case "license", "template", "system", "prompt":
 			fn(api.ProgressResponse{Status: fmt.Sprintf("creating model %s layer", c.Name)})
 			// remove the prompt layer if one exists
 			mediaType := fmt.Sprintf("application/vnd.ollama.image.%s", c.Name)
@@ -373,6 +335,107 @@ func CreateModel(name string, path string, fn func(resp api.ProgressResponse)) e
 		default:
 			// runtime parameters, build a list of args for each parameter to allow multiple values to be specified (ex: multiple stop tokens)
 			params[c.Name] = append(params[c.Name], c.Args)
+		}
+	}
+
+	// generate the embedding layers
+	if len(embedFiles) > 0 {
+		// if _, err := os.Stat(modelFile); err != nil {
+		// 	return fmt.Errorf("embedding failed: model file '%s' does not exist", modelFile)
+		// }
+		opts := api.DefaultOptions()
+		opts.EmbeddingOnly = true
+		// TODO
+		// if err := opts.FromMap(params); err != nil {
+		// 	return fmt.Errorf("failed to load embedding model options: %w", err)
+		// }
+
+		// TODO: this modelFile may not exist yet at this point
+		model, err := GetModel(modelFile)
+		if err != nil {
+			return fmt.Errorf("failed to get model: %v", err)
+		}
+		llm, err := llama.New(model.ModelPath, opts)
+		if err != nil {
+			return fmt.Errorf("load model to generate embeddings: %v", err)
+		}
+		for _, e := range embedFiles {
+			// TODO: check if txt file type
+			f, err := os.Open(e)
+			if err != nil {
+				return fmt.Errorf("could not open embed file: %w", err)
+			}
+			scanner := bufio.NewScanner(f)
+			scanner.Split(bufio.ScanLines)
+
+			data := []string{}
+			for scanner.Scan() {
+				data = append(data, scanner.Text())
+			}
+			f.Close()
+
+			digest, _ := GetSHA256Digest(bytes.NewReader([]byte(e)))
+
+			embeddings := []vector.Embedding{}
+			for i, d := range data {
+				if strings.TrimSpace(d) == "" {
+					continue
+				}
+				fn(api.ProgressResponse{
+					Status:    fmt.Sprintf("creating embeddings for file %s", e),
+					Digest:    digest,
+					Total:     len(data) - 1,
+					Completed: i,
+				})
+				retry := 0
+			generate:
+				if retry > 3 {
+					log.Printf("failed to generate embedding for '%s': %v", e, err)
+					continue
+				}
+				embed, err := llm.Embedding(d)
+				if err != nil {
+					log.Printf("failed to get embedding for '%s': %v", d, err)
+					continue
+				}
+				// Check for NaN and Inf in the embedding, which can't be stored
+				for _, value := range embed {
+					if math.IsNaN(value) || math.IsInf(value, 0) {
+						log.Printf("reloading model, embedding for contains NaN or Inf")
+						// reload the model to get a new embedding
+						llm, err = llama.New(model.ModelPath, opts)
+						if err != nil {
+							return fmt.Errorf("load model to generate embeddings: %v", err)
+						}
+						retry++
+						goto generate
+					}
+				}
+				embeddings = append(embeddings, vector.Embedding{Data: d, Vector: embed})
+			}
+
+			b, err := json.Marshal(embeddings)
+			if err != nil {
+				return fmt.Errorf("failed to encode embeddings: %w", err)
+			}
+			r := bytes.NewReader(b)
+
+			digest, size := GetSHA256Digest(r)
+			// Reset the position of the reader after calculating the digest
+			if _, err := r.Seek(0, 0); err != nil {
+				return fmt.Errorf("could not reset embed reader: %w", err)
+			}
+
+			layer := &LayerReader{
+				Layer: Layer{
+					MediaType: "application/vnd.ollama.image.embed",
+					Digest:    digest,
+					Size:      size,
+				},
+				Reader: r,
+			}
+
+			layers = append(layers, layer)
 		}
 	}
 
@@ -1107,7 +1170,7 @@ func downloadBlob(mp ModelPath, digest string, regOpts *RegistryOptions, fn func
 
 	for {
 		fn(api.ProgressResponse{
-			Status:    fmt.Sprintf("downloading %s", digest),
+			Status:    fmt.Sprintf("pulling %s...", digest[7:19]),
 			Digest:    digest,
 			Total:     int(total),
 			Completed: int(completed),

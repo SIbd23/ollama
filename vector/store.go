@@ -45,7 +45,7 @@ func TopK(k int, query *mat.VecDense, embeddings []Embedding) []EmbeddingSimilar
 	h := &Heap{}
 	heap.Init(h)
 	for _, emb := range embeddings {
-		similarity := cosineSimilarity(query, emb.Vector)
+		similarity := cosineSimilarity(query, mat.NewVecDense(len(emb.Vector), emb.Vector))
 		heap.Push(h, EmbeddingSimilarity{Embedding: emb, Similarity: similarity})
 		if h.Len() > k {
 			heap.Pop(h)
